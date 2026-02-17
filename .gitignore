@@ -7,5 +7,9 @@ data/
 *.sqlite-wal
 *.sqlite-shm
 
+# SSH keys (keep deploy_key out of git)
+.ssh/deploy_key
+.ssh/deploy_key*
+
 # OS
 .DS_Store
