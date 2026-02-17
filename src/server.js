@@ -69,6 +69,7 @@ function page(title, body) {
       <strong>Policy-to-Code</strong>
       <span class="pill">MVP</span>
       <a href="/">Policies</a>
+      <a href="/dashboard">Dashboard</a>
       <a href="/policies/new">New Policy</a>
     </div>
     <div class="row muted small">${escapeHtml(new Date().toISOString())}</div>
@@ -158,12 +159,26 @@ function initDb() {
       created_at TEXT NOT NULL
     );
 
+    -- Evidence (manual first; later sync from ADO)
+    CREATE TABLE IF NOT EXISTS evidence (
+      id TEXT PRIMARY KEY,
+      target_type TEXT NOT NULL, -- 'decision' | 'rule'
+      target_id TEXT NOT NULL,
+      kind TEXT NOT NULL,        -- 'pr' | 'commit' | 'build' | 'deploy' | 'doc' | 'link'
+      ref TEXT NOT NULL,
+      status TEXT,               -- optional: 'draft' | 'approved'
+      notes TEXT,
+      created_at TEXT NOT NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_requirements_policy_id ON requirements(policy_id);
     CREATE INDEX IF NOT EXISTS idx_decisions_requirement_id ON decisions(requirement_id);
     CREATE INDEX IF NOT EXISTS idx_rules_decision_id ON rules(decision_id);
     CREATE INDEX IF NOT EXISTS idx_test_cases_rule_id ON test_cases(rule_id);
     CREATE INDEX IF NOT EXISTS idx_mappings_target ON mappings(target_type, target_id);
     CREATE INDEX IF NOT EXISTS idx_mappings_type ON mappings(type);
+    CREATE INDEX IF NOT EXISTS idx_evidence_target ON evidence(target_type, target_id);
+    CREATE INDEX IF NOT EXISTS idx_evidence_kind ON evidence(kind);
   `);
   return db;
 }
@@ -199,7 +214,12 @@ const q = {
   listMappings: db.prepare('SELECT * FROM mappings WHERE target_type = ? AND target_id = ? ORDER BY created_at ASC'),
   insertMapping: db.prepare(`INSERT INTO mappings (id, target_type, target_id, type, ref, notes, created_at)
     VALUES (@id,@target_type,@target_id,@type,@ref,@notes,@created_at)`),
-  deleteMapping: db.prepare('DELETE FROM mappings WHERE id = ?')
+  deleteMapping: db.prepare('DELETE FROM mappings WHERE id = ?'),
+
+  listEvidence: db.prepare('SELECT * FROM evidence WHERE target_type = ? AND target_id = ? ORDER BY created_at ASC'),
+  insertEvidence: db.prepare(`INSERT INTO evidence (id, target_type, target_id, kind, ref, status, notes, created_at)
+    VALUES (@id,@target_type,@target_id,@kind,@ref,@status,@notes,@created_at)`),
+  deleteEvidence: db.prepare('DELETE FROM evidence WHERE id = ?')
 };
 
 // ---------- routes ----------
@@ -225,6 +245,207 @@ app.get('/', (req, res) => {
     </div>
   `;
   res.type('html').send(page('Policies', body));
+});
+
+app.get('/dashboard', (req, res) => {
+  const policies = q.listPolicies.all();
+  const selectedPolicyId = req.query.policyId || (policies[0]?.id ?? null);
+  const policy = selectedPolicyId ? q.getPolicy.get(selectedPolicyId) : null;
+
+  const requirements = policy ? q.listRequirements.all(policy.id) : [];
+
+  // Compute coverage metrics per requirement
+  const rows = requirements.map((r) => {
+    const decisions = q.listDecisionsByRequirement.all(r.id);
+    const approvedDecisions = decisions.filter(d => d.status === 'approved');
+
+    const rules = decisions.flatMap(d => q.listRulesByDecision.all(d.id));
+    const testCount = rules.reduce((acc, rule) => acc + q.listTestCasesByRule.all(rule.id).length, 0);
+
+    const decisionEvidenceCount = decisions.reduce((acc, d) => acc + q.listEvidence.all('decision', d.id).length, 0);
+    const ruleEvidenceCount = rules.reduce((acc, rule) => acc + q.listEvidence.all('rule', rule.id).length, 0);
+    const evidenceCount = decisionEvidenceCount + ruleEvidenceCount;
+
+    const hasDecisionApproved = approvedDecisions.length > 0;
+    const hasRule = rules.length > 0;
+    const hasTests = testCount > 0;
+    const hasEvidence = evidenceCount > 0;
+
+    const fullyTraceable = hasDecisionApproved && hasRule && hasTests && hasEvidence;
+
+    return {
+      requirement: r,
+      decisions,
+      approvedDecisions,
+      rules,
+      testCount,
+      evidenceCount,
+      hasDecisionApproved,
+      hasRule,
+      hasTests,
+      hasEvidence,
+      fullyTraceable
+    };
+  });
+
+  const reqTotal = requirements.length;
+  const reqTraceable = rows.filter(x => x.fullyTraceable).length;
+  const reqWithApprovedDecision = rows.filter(x => x.hasDecisionApproved).length;
+
+  const decisionsTotal = rows.reduce((a, x) => a + x.decisions.length, 0);
+  const decisionsApproved = rows.reduce((a, x) => a + x.approvedDecisions.length, 0);
+
+  const rulesTotal = rows.reduce((a, x) => a + x.rules.length, 0);
+  const testsTotal = rows.reduce((a, x) => a + x.testCount, 0);
+  const evidenceTotal = rows.reduce((a, x) => a + x.evidenceCount, 0);
+
+  const pct = (n, d) => (d ? Math.round((n / d) * 100) : 0);
+
+  // Impact counts from mappings across all decisions and rules
+  let impact = { service: 0, api: 0, data: 0, integration: 0, security: 0 };
+  if (policy) {
+    for (const r of requirements) {
+      const decisions = q.listDecisionsByRequirement.all(r.id);
+      for (const d of decisions) {
+        for (const m of q.listMappings.all('decision', d.id)) {
+          impact[m.type] = (impact[m.type] || 0) + 1;
+        }
+        for (const rule of q.listRulesByDecision.all(d.id)) {
+          for (const m of q.listMappings.all('rule', rule.id)) {
+            impact[m.type] = (impact[m.type] || 0) + 1;
+          }
+        }
+      }
+    }
+  }
+
+  const kpiCard = (label, value, sub = '') => `
+    <div class="card" style="margin:0">
+      <div class="muted small">${escapeHtml(label)}</div>
+      <div style="font-size:28px; font-weight:700; margin-top:4px">${escapeHtml(value)}</div>
+      ${sub ? `<div class="muted small" style="margin-top:6px">${sub}</div>` : ''}
+    </div>
+  `;
+
+  const flowBar = (label, value, max) => {
+    const w = max ? Math.max(2, Math.round((value / max) * 100)) : 0;
+    return `
+      <div style="margin:10px 0">
+        <div class="row"><div style="width:180px" class="muted small">${escapeHtml(label)}</div><div class="mono small">${value}</div></div>
+        <div style="height:10px; background:#0b1020; border:1px solid var(--border); border-radius:999px; overflow:hidden; margin-top:6px">
+          <div style="height:10px; width:${w}%; background:#3b82f6"></div>
+        </div>
+      </div>
+    `;
+  };
+
+  const heatCell = (ok) => {
+    const bg = ok ? '#0f2d1f' : '#3a1d1d';
+    const bd = ok ? '#1e8e5a' : '#ff6b6b';
+    const txt = ok ? 'OK' : 'MISS';
+    return `<span class="pill" style="background:${bg}; border-color:${bd}; color:${ok ? '#bff3d6' : '#ffd0d0'}">${txt}</span>`;
+  };
+
+  const policySelect = `
+    <form method="get" action="/dashboard" class="row wrap" style="gap:12px">
+      <div>
+        <label>Policy</label>
+        <select name="policyId" onchange="this.form.submit()">
+          ${policies.map(p => `<option value="${escapeHtml(p.id)}" ${p.id === selectedPolicyId ? 'selected' : ''}>${escapeHtml(p.title)}</option>`).join('')}
+        </select>
+      </div>
+      ${policy ? `<div class="muted small" style="margin-top:22px">Effective: <span class="mono">${escapeHtml(policy.effective_date || '—')}</span></div>` : ''}
+    </form>
+  `;
+
+  const body = `
+    <div class="card">
+      <div class="row wrap">
+        <div>
+          <h1 style="margin:0">Executive dashboard</h1>
+          <div class="muted">Readiness, coverage, impact, and risk — policy-specific.</div>
+        </div>
+        <div class="right">${policySelect}</div>
+      </div>
+    </div>
+
+    ${policy ? `
+    <div class="grid grid2">
+      ${kpiCard('Requirements traceable', `${reqTraceable}/${reqTotal}`, `${pct(reqTraceable, reqTotal)}% fully traceable (approved decision + rule + tests + evidence)`)}
+      ${kpiCard('Requirements w/ approved decision', `${reqWithApprovedDecision}/${reqTotal}`, `${pct(reqWithApprovedDecision, reqTotal)}% have at least one approved decision`)}
+      ${kpiCard('Decisions approved', `${decisionsApproved}/${decisionsTotal}`, `${pct(decisionsApproved, decisionsTotal)}% of recorded decisions approved`)}
+      ${kpiCard('Rules / Tests / Evidence', `${rulesTotal} / ${testsTotal} / ${evidenceTotal}`, `counts for selected policy`)}
+    </div>
+
+    <div class="grid grid2">
+      <div class="card">
+        <h2 style="margin:0">Flow coverage</h2>
+        <div class="muted small">Quick visual of where the chain thins out.</div>
+        <div class="hr"></div>
+        ${(() => {
+          const max = Math.max(reqTotal, decisionsTotal, rulesTotal, testsTotal, evidenceTotal);
+          return [
+            flowBar('Requirements', reqTotal, max),
+            flowBar('Decisions', decisionsTotal, max),
+            flowBar('Rules', rulesTotal, max),
+            flowBar('Test cases', testsTotal, max),
+            flowBar('Evidence items', evidenceTotal, max),
+          ].join('');
+        })()}
+      </div>
+
+      <div class="card">
+        <h2 style="margin:0">Impact (architecture)</h2>
+        <div class="muted small">Counts of mappings linked to this policy.</div>
+        <div class="hr"></div>
+        <div class="kvs">
+          ${Object.entries(impact).map(([k,v]) => `<div class="muted">${escapeHtml(k)}</div><div><span class="mono">${v}</span></div>`).join('')}
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <h2 style="margin:0">Coverage heatmap</h2>
+        <div class="right muted small">Requirement-level completeness snapshot</div>
+      </div>
+      <div class="hr"></div>
+      ${rows.length ? `
+        <table style="width:100%; border-collapse:collapse">
+          <thead>
+            <tr class="muted small">
+              <th style="text-align:left; padding:8px; border-bottom:1px solid var(--border)">Requirement</th>
+              <th style="text-align:left; padding:8px; border-bottom:1px solid var(--border)">Decision approved</th>
+              <th style="text-align:left; padding:8px; border-bottom:1px solid var(--border)">Rules</th>
+              <th style="text-align:left; padding:8px; border-bottom:1px solid var(--border)">Tests</th>
+              <th style="text-align:left; padding:8px; border-bottom:1px solid var(--border)">Evidence</th>
+              <th style="text-align:left; padding:8px; border-bottom:1px solid var(--border)">Traceable</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows.map(x => `
+              <tr>
+                <td style="padding:10px; border-bottom:1px solid rgba(40,52,94,0.5)">
+                  <div class="small">${escapeHtml(x.requirement.statement)}</div>
+                  <div class="muted small">status: <span class="mono">${escapeHtml(x.requirement.status)}</span></div>
+                </td>
+                <td style="padding:10px; border-bottom:1px solid rgba(40,52,94,0.5)">${heatCell(x.hasDecisionApproved)}</td>
+                <td style="padding:10px; border-bottom:1px solid rgba(40,52,94,0.5)">${heatCell(x.hasRule)} <span class="muted small mono">${x.rules.length}</span></td>
+                <td style="padding:10px; border-bottom:1px solid rgba(40,52,94,0.5)">${heatCell(x.hasTests)} <span class="muted small mono">${x.testCount}</span></td>
+                <td style="padding:10px; border-bottom:1px solid rgba(40,52,94,0.5)">${heatCell(x.hasEvidence)} <span class="muted small mono">${x.evidenceCount}</span></td>
+                <td style="padding:10px; border-bottom:1px solid rgba(40,52,94,0.5)">${heatCell(x.fullyTraceable)}</td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      ` : `<p class="muted">No requirements yet.</p>`}
+    </div>
+    ` : `
+      <div class="card"><p class="muted">No policies yet. Create one first.</p></div>
+    `}
+  `;
+
+  res.type('html').send(page('Dashboard', body));
 });
 
 app.get('/policies/new', (req, res) => {
@@ -463,6 +684,7 @@ app.get('/decisions/:decisionId', (req, res) => {
   const policy = q.getPolicy.get(requirement.policy_id);
   const rules = q.listRulesByDecision.all(decision.id);
   const mappings = q.listMappings.all('decision', decision.id);
+  const evidence = q.listEvidence.all('decision', decision.id);
 
   const body = `
     <div class="card">
@@ -537,6 +759,62 @@ app.get('/decisions/:decisionId', (req, res) => {
 
     <div class="card">
       <div class="row">
+        <h2 style="margin:0">Evidence</h2>
+        <div class="right"><span class="muted small">Attach delivery evidence (manual now; ADO sync later).</span></div>
+      </div>
+      <div class="hr"></div>
+      ${evidence.length ? `<ul>${evidence.map(ev => `
+        <li style="margin:10px 0">
+          <span class="pill">${escapeHtml(ev.kind)}</span>
+          <strong>${escapeHtml(ev.ref)}</strong>
+          ${ev.status ? ` <span class="muted small">(${escapeHtml(ev.status)})</span>` : ''}
+          ${ev.notes ? `<div class="muted small">${escapeHtml(ev.notes)}</div>` : ''}
+          <form method="post" action="/evidence/${ev.id}/delete" style="margin-top:6px">
+            <input type="hidden" name="back" value="/decisions/${decision.id}" />
+            <button type="submit" class="small">Delete</button>
+          </form>
+        </li>
+      `).join('')}</ul>` : `<p class="muted">No evidence yet.</p>`}
+
+      <div class="hr"></div>
+      <form class="grid" method="post" action="/decisions/${decision.id}/evidence">
+        <div class="grid grid2">
+          <div>
+            <label>Kind</label>
+            <select name="kind">
+              <option value="pr">pr</option>
+              <option value="commit">commit</option>
+              <option value="build">build</option>
+              <option value="deploy">deploy</option>
+              <option value="doc">doc</option>
+              <option value="link">link</option>
+            </select>
+          </div>
+          <div>
+            <label>Ref (URL or identifier)</label>
+            <input name="ref" required placeholder="e.g., https://dev.azure.com/.../pullrequest/123" />
+          </div>
+        </div>
+        <div class="grid grid2">
+          <div>
+            <label>Status</label>
+            <select name="status">
+              <option value="">(none)</option>
+              <option value="draft">draft</option>
+              <option value="approved">approved</option>
+            </select>
+          </div>
+          <div>
+            <label>Notes</label>
+            <input name="notes" placeholder="optional" />
+          </div>
+        </div>
+        <div class="row"><button type="submit">Add evidence</button></div>
+      </form>
+    </div>
+
+    <div class="card">
+      <div class="row">
         <h2 style="margin:0">Rules</h2>
         <div class="right"><span class="muted small">Define implementation logic for the decision.</span></div>
       </div>
@@ -602,6 +880,26 @@ app.post('/decisions/:decisionId/mappings', (req, res) => {
   res.redirect(`/decisions/${decision.id}`);
 });
 
+app.post('/decisions/:decisionId/evidence', (req, res) => {
+  const decision = q.getDecision.get(req.params.decisionId);
+  if (!decision) return res.status(404).send('Decision not found');
+
+  const id = nanoid();
+  const now = new Date().toISOString();
+  q.insertEvidence.run({
+    id,
+    target_type: 'decision',
+    target_id: decision.id,
+    kind: req.body.kind?.trim() || 'link',
+    ref: req.body.ref?.trim(),
+    status: req.body.status?.trim() || null,
+    notes: req.body.notes?.trim() || null,
+    created_at: now
+  });
+
+  res.redirect(`/decisions/${decision.id}`);
+});
+
 app.post('/decisions/:decisionId/rules', (req, res) => {
   const decision = q.getDecision.get(req.params.decisionId);
   if (!decision) return res.status(404).send('Decision not found');
@@ -631,6 +929,7 @@ app.get('/rules/:ruleId', (req, res) => {
   const policy = q.getPolicy.get(requirement.policy_id);
   const testCases = q.listTestCasesByRule.all(rule.id);
   const mappings = q.listMappings.all('rule', rule.id);
+  const evidence = q.listEvidence.all('rule', rule.id);
 
   const body = `
     <div class="card">
@@ -705,6 +1004,63 @@ app.get('/rules/:ruleId', (req, res) => {
 
     <div class="card">
       <div class="row">
+        <h2 style="margin:0">Evidence</h2>
+        <div class="right muted small">Attach delivery evidence (manual now; ADO sync later).</div>
+      </div>
+      <div class="hr"></div>
+
+      ${evidence.length ? `<ul>${evidence.map(ev => `
+        <li style="margin:10px 0">
+          <span class="pill">${escapeHtml(ev.kind)}</span>
+          <strong>${escapeHtml(ev.ref)}</strong>
+          ${ev.status ? ` <span class="muted small">(${escapeHtml(ev.status)})</span>` : ''}
+          ${ev.notes ? `<div class="muted small">${escapeHtml(ev.notes)}</div>` : ''}
+          <form method="post" action="/evidence/${ev.id}/delete" style="margin-top:6px">
+            <input type="hidden" name="back" value="/rules/${rule.id}" />
+            <button type="submit" class="small">Delete</button>
+          </form>
+        </li>
+      `).join('')}</ul>` : `<p class="muted">No evidence yet.</p>`}
+
+      <div class="hr"></div>
+      <form class="grid" method="post" action="/rules/${rule.id}/evidence">
+        <div class="grid grid2">
+          <div>
+            <label>Kind</label>
+            <select name="kind">
+              <option value="pr">pr</option>
+              <option value="commit">commit</option>
+              <option value="build">build</option>
+              <option value="deploy">deploy</option>
+              <option value="doc">doc</option>
+              <option value="link">link</option>
+            </select>
+          </div>
+          <div>
+            <label>Ref (URL or identifier)</label>
+            <input name="ref" required placeholder="e.g., release 1.3.7" />
+          </div>
+        </div>
+        <div class="grid grid2">
+          <div>
+            <label>Status</label>
+            <select name="status">
+              <option value="">(none)</option>
+              <option value="draft">draft</option>
+              <option value="approved">approved</option>
+            </select>
+          </div>
+          <div>
+            <label>Notes</label>
+            <input name="notes" placeholder="optional" />
+          </div>
+        </div>
+        <div class="row"><button type="submit">Add evidence</button></div>
+      </form>
+    </div>
+
+    <div class="card">
+      <div class="row">
         <h2 style="margin:0">Test Cases</h2>
         <div class="right muted small">Given/Expected stored as JSON strings (start simple; we can evolve).</div>
       </div>
@@ -774,6 +1130,26 @@ app.post('/rules/:ruleId/mappings', (req, res) => {
   res.redirect(`/rules/${rule.id}`);
 });
 
+app.post('/rules/:ruleId/evidence', (req, res) => {
+  const rule = q.getRule.get(req.params.ruleId);
+  if (!rule) return res.status(404).send('Rule not found');
+
+  const id = nanoid();
+  const now = new Date().toISOString();
+  q.insertEvidence.run({
+    id,
+    target_type: 'rule',
+    target_id: rule.id,
+    kind: req.body.kind?.trim() || 'link',
+    ref: req.body.ref?.trim(),
+    status: req.body.status?.trim() || null,
+    notes: req.body.notes?.trim() || null,
+    created_at: now
+  });
+
+  res.redirect(`/rules/${rule.id}`);
+});
+
 app.post('/rules/:ruleId/test-cases', (req, res) => {
   const rule = q.getRule.get(req.params.ruleId);
   if (!rule) return res.status(404).send('Rule not found');
@@ -796,6 +1172,12 @@ app.post('/rules/:ruleId/test-cases', (req, res) => {
 app.post('/mappings/:mappingId/delete', (req, res) => {
   const back = req.body.back || '/';
   q.deleteMapping.run(req.params.mappingId);
+  res.redirect(back);
+});
+
+app.post('/evidence/:evidenceId/delete', (req, res) => {
+  const back = req.body.back || '/';
+  q.deleteEvidence.run(req.params.evidenceId);
   res.redirect(back);
 });
 
@@ -848,6 +1230,15 @@ app.get('/policies/:policyId/export', (req, res) => {
         out += `\n`;
       }
 
+      const decisionEvidence = q.listEvidence.all('decision', d.id);
+      if (decisionEvidence.length) {
+        out += `**Evidence (Decision)**\n\n`;
+        for (const ev of decisionEvidence) {
+          out += `- ${ev.kind}: ${ev.ref}${ev.status ? ` (${ev.status})` : ''}${ev.notes ? ` — ${ev.notes}` : ''}\n`;
+        }
+        out += `\n`;
+      }
+
       const rules = q.listRulesByDecision.all(d.id);
       if (!rules.length) {
         out += `> No rules recorded for this decision yet.\n\n`;
@@ -867,6 +1258,15 @@ app.get('/policies/:policyId/export', (req, res) => {
           out += `**Architecture mappings (Rule)**\n\n`;
           for (const m of ruleMappings) {
             out += `- ${m.type}: ${m.ref}${m.notes ? ` — ${m.notes}` : ''}\n`;
+          }
+          out += `\n`;
+        }
+
+        const ruleEvidence = q.listEvidence.all('rule', rule.id);
+        if (ruleEvidence.length) {
+          out += `**Evidence (Rule)**\n\n`;
+          for (const ev of ruleEvidence) {
+            out += `- ${ev.kind}: ${ev.ref}${ev.status ? ` (${ev.status})` : ''}${ev.notes ? ` — ${ev.notes}` : ''}\n`;
           }
           out += `\n`;
         }
