@@ -1,19 +1,41 @@
-# Policy-to-Code
+# policy-to-code
 
-Turn plain-language policies into executable, testable code artifacts.
+Government-specific traceability MVP: **Policy → Requirements → Decisions (ADRs) → Rules → Test Cases → Export (audit report)**.
 
-## Status
-This repository is bootstrapped with project documentation scaffolding. Next step: define the v1 scope and architecture.
+This repo is currently a “bootstrap + build” workspace.
 
-## Quickstart (placeholder)
-- TBD
+## MVP (current)
 
-## Documentation
-- `PROJECT.md` — living project spec (what we're building + current milestone)
-- `TODO.md` — now/next/later
-- `docs/adr/` — architecture decision records
-- `memory/` — dated session logs
+- Create **Policies**
+- Add **Requirements**
+- Capture **Decisions (ADRs)**
+- Define **Rules** (versioned text for now)
+- Add **Test Cases** (Given/Expected JSON)
+- Export a **Policy Implementation Report** (Markdown)
 
-## Contributing
-- Create a branch
-- Open a PR
+## Run locally
+
+```bash
+cd policy-to-code
+npm install
+npm run dev
+```
+
+Then open: http://127.0.0.1:3000
+
+### Data storage
+
+By default the app uses SQLite at:
+
+- `./data/policy_to_code.sqlite`
+
+Override with:
+
+- `DB_PATH=/some/path.sqlite npm run dev`
+
+## Next milestones
+
+- Better exports (HTML/PDF “audit packet”)
+- Architecture mapping (services/APIs/tables/integrations)
+- Evidence objects (manual first)
+- Azure DevOps integration (later)

@@ -1,0 +1,11 @@
+# Node
+node_modules/
+
+# Local DB/data
+data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# OS
+.DS_Store
