@@ -1,6 +1,8 @@
 import express from 'express';
 import Database from 'better-sqlite3';
 import { nanoid } from 'nanoid';
+import fs from 'node:fs';
+import path from 'node:path';
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
 const DB_PATH = process.env.DB_PATH || './data/policy_to_code.sqlite';
@@ -79,10 +81,8 @@ ${body}
 </html>`;
 }
 
-function ensureDir(path) {
-  // Lazy import to avoid top-level dependency.
-  const fs = require('node:fs');
-  const dir = require('node:path').dirname(path);
+function ensureDir(p) {
+  const dir = path.dirname(p);
   fs.mkdirSync(dir, { recursive: true });
 }
 
