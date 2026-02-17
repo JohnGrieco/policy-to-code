@@ -147,10 +147,23 @@ function initDb() {
       FOREIGN KEY(rule_id) REFERENCES rules(id) ON DELETE CASCADE
     );
 
+    -- Architecture mappings (attach to either a decision or a rule)
+    CREATE TABLE IF NOT EXISTS mappings (
+      id TEXT PRIMARY KEY,
+      target_type TEXT NOT NULL, -- 'decision' | 'rule'
+      target_id TEXT NOT NULL,
+      type TEXT NOT NULL,        -- 'service' | 'api' | 'data' | 'integration' | 'security'
+      ref TEXT NOT NULL,
+      notes TEXT,
+      created_at TEXT NOT NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_requirements_policy_id ON requirements(policy_id);
     CREATE INDEX IF NOT EXISTS idx_decisions_requirement_id ON decisions(requirement_id);
     CREATE INDEX IF NOT EXISTS idx_rules_decision_id ON rules(decision_id);
     CREATE INDEX IF NOT EXISTS idx_test_cases_rule_id ON test_cases(rule_id);
+    CREATE INDEX IF NOT EXISTS idx_mappings_target ON mappings(target_type, target_id);
+    CREATE INDEX IF NOT EXISTS idx_mappings_type ON mappings(type);
   `);
   return db;
 }
@@ -181,7 +194,12 @@ const q = {
 
   listTestCasesByRule: db.prepare('SELECT * FROM test_cases WHERE rule_id = ? ORDER BY created_at ASC'),
   insertTestCase: db.prepare(`INSERT INTO test_cases (id, rule_id, name, given_json, expected_json, notes, created_at)
-    VALUES (@id,@rule_id,@name,@given_json,@expected_json,@notes,@created_at)`)
+    VALUES (@id,@rule_id,@name,@given_json,@expected_json,@notes,@created_at)`),
+
+  listMappings: db.prepare('SELECT * FROM mappings WHERE target_type = ? AND target_id = ? ORDER BY created_at ASC'),
+  insertMapping: db.prepare(`INSERT INTO mappings (id, target_type, target_id, type, ref, notes, created_at)
+    VALUES (@id,@target_type,@target_id,@type,@ref,@notes,@created_at)`),
+  deleteMapping: db.prepare('DELETE FROM mappings WHERE id = ?')
 };
 
 // ---------- routes ----------
@@ -444,6 +462,7 @@ app.get('/decisions/:decisionId', (req, res) => {
   const requirement = q.getRequirement.get(decision.requirement_id);
   const policy = q.getPolicy.get(requirement.policy_id);
   const rules = q.listRulesByDecision.all(decision.id);
+  const mappings = q.listMappings.all('decision', decision.id);
 
   const body = `
     <div class="card">
@@ -470,6 +489,50 @@ app.get('/decisions/:decisionId', (req, res) => {
           <div>${decision.alternatives ? escapeHtml(decision.alternatives).replaceAll('\n','<br/>') : '<span class="muted">—</span>'}</div>
         </div>
       </div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <h2 style="margin:0">Architecture mappings</h2>
+        <div class="right"><span class="muted small">Map this decision to systems/components (manual for now).</span></div>
+      </div>
+      <div class="hr"></div>
+      ${mappings.length ? `<ul>${mappings.map(m => `
+        <li style="margin:10px 0">
+          <span class="pill">${escapeHtml(m.type)}</span>
+          <strong>${escapeHtml(m.ref)}</strong>
+          ${m.notes ? `<div class="muted small">${escapeHtml(m.notes)}</div>` : ''}
+          <form method="post" action="/mappings/${m.id}/delete" style="margin-top:6px">
+            <input type="hidden" name="back" value="/decisions/${decision.id}" />
+            <button type="submit" class="small">Delete</button>
+          </form>
+        </li>
+      `).join('')}</ul>` : `<p class="muted">No mappings yet.</p>`}
+
+      <div class="hr"></div>
+      <form class="grid" method="post" action="/decisions/${decision.id}/mappings">
+        <div class="grid grid2">
+          <div>
+            <label>Type</label>
+            <select name="type">
+              <option value="service">service</option>
+              <option value="api">api</option>
+              <option value="data">data</option>
+              <option value="integration">integration</option>
+              <option value="security">security</option>
+            </select>
+          </div>
+          <div>
+            <label>Ref</label>
+            <input name="ref" required placeholder="e.g., VerificationHub.API" />
+          </div>
+        </div>
+        <div>
+          <label>Notes</label>
+          <input name="notes" placeholder="optional" />
+        </div>
+        <div class="row"><button type="submit">Add mapping</button></div>
+      </form>
     </div>
 
     <div class="card">
@@ -520,6 +583,25 @@ app.get('/decisions/:decisionId', (req, res) => {
   res.type('html').send(page('Decision', body));
 });
 
+app.post('/decisions/:decisionId/mappings', (req, res) => {
+  const decision = q.getDecision.get(req.params.decisionId);
+  if (!decision) return res.status(404).send('Decision not found');
+
+  const id = nanoid();
+  const now = new Date().toISOString();
+  q.insertMapping.run({
+    id,
+    target_type: 'decision',
+    target_id: decision.id,
+    type: req.body.type?.trim() || 'service',
+    ref: req.body.ref?.trim(),
+    notes: req.body.notes?.trim() || null,
+    created_at: now
+  });
+
+  res.redirect(`/decisions/${decision.id}`);
+});
+
 app.post('/decisions/:decisionId/rules', (req, res) => {
   const decision = q.getDecision.get(req.params.decisionId);
   if (!decision) return res.status(404).send('Decision not found');
@@ -548,6 +630,7 @@ app.get('/rules/:ruleId', (req, res) => {
   const requirement = q.getRequirement.get(decision.requirement_id);
   const policy = q.getPolicy.get(requirement.policy_id);
   const testCases = q.listTestCasesByRule.all(rule.id);
+  const mappings = q.listMappings.all('rule', rule.id);
 
   const body = `
     <div class="card">
@@ -573,6 +656,51 @@ app.get('/rules/:ruleId', (req, res) => {
         Requirement: ${escapeHtml(requirement.statement)}<br/>
         Decision: ${escapeHtml(decision.decision)}
       </div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <h2 style="margin:0">Architecture mappings</h2>
+        <div class="right muted small">Map this rule to systems/components (manual for now).</div>
+      </div>
+      <div class="hr"></div>
+
+      ${mappings.length ? `<ul>${mappings.map(m => `
+        <li style="margin:10px 0">
+          <span class="pill">${escapeHtml(m.type)}</span>
+          <strong>${escapeHtml(m.ref)}</strong>
+          ${m.notes ? `<div class="muted small">${escapeHtml(m.notes)}</div>` : ''}
+          <form method="post" action="/mappings/${m.id}/delete" style="margin-top:6px">
+            <input type="hidden" name="back" value="/rules/${rule.id}" />
+            <button type="submit" class="small">Delete</button>
+          </form>
+        </li>
+      `).join('')}</ul>` : `<p class="muted">No mappings yet.</p>`}
+
+      <div class="hr"></div>
+      <form class="grid" method="post" action="/rules/${rule.id}/mappings">
+        <div class="grid grid2">
+          <div>
+            <label>Type</label>
+            <select name="type">
+              <option value="service">service</option>
+              <option value="api">api</option>
+              <option value="data">data</option>
+              <option value="integration">integration</option>
+              <option value="security">security</option>
+            </select>
+          </div>
+          <div>
+            <label>Ref</label>
+            <input name="ref" required placeholder="e.g., WorkRequirementStatus" />
+          </div>
+        </div>
+        <div>
+          <label>Notes</label>
+          <input name="notes" placeholder="optional" />
+        </div>
+        <div class="row"><button type="submit">Add mapping</button></div>
+      </form>
     </div>
 
     <div class="card">
@@ -627,6 +755,25 @@ app.get('/rules/:ruleId', (req, res) => {
   res.type('html').send(page('Rule', body));
 });
 
+app.post('/rules/:ruleId/mappings', (req, res) => {
+  const rule = q.getRule.get(req.params.ruleId);
+  if (!rule) return res.status(404).send('Rule not found');
+
+  const id = nanoid();
+  const now = new Date().toISOString();
+  q.insertMapping.run({
+    id,
+    target_type: 'rule',
+    target_id: rule.id,
+    type: req.body.type?.trim() || 'service',
+    ref: req.body.ref?.trim(),
+    notes: req.body.notes?.trim() || null,
+    created_at: now
+  });
+
+  res.redirect(`/rules/${rule.id}`);
+});
+
 app.post('/rules/:ruleId/test-cases', (req, res) => {
   const rule = q.getRule.get(req.params.ruleId);
   if (!rule) return res.status(404).send('Rule not found');
@@ -644,6 +791,12 @@ app.post('/rules/:ruleId/test-cases', (req, res) => {
   });
 
   res.redirect(`/rules/${rule.id}`);
+});
+
+app.post('/mappings/:mappingId/delete', (req, res) => {
+  const back = req.body.back || '/';
+  q.deleteMapping.run(req.params.mappingId);
+  res.redirect(back);
 });
 
 app.get('/policies/:policyId/export', (req, res) => {
@@ -686,6 +839,15 @@ app.get('/policies/:policyId/export', (req, res) => {
       if (d.rationale) out += `**Rationale:**\n\n${d.rationale}\n\n`;
       if (d.alternatives) out += `**Alternatives:**\n\n${d.alternatives}\n\n`;
 
+      const decisionMappings = q.listMappings.all('decision', d.id);
+      if (decisionMappings.length) {
+        out += `**Architecture mappings (Decision)**\n\n`;
+        for (const m of decisionMappings) {
+          out += `- ${m.type}: ${m.ref}${m.notes ? ` — ${m.notes}` : ''}\n`;
+        }
+        out += `\n`;
+      }
+
       const rules = q.listRulesByDecision.all(d.id);
       if (!rules.length) {
         out += `> No rules recorded for this decision yet.\n\n`;
@@ -699,6 +861,15 @@ app.get('/policies/:policyId/export', (req, res) => {
         if (rule.exceptions) out += `- Exceptions: ${rule.exceptions}\n`;
         out += `\n`;
         out += "```\n" + rule.definition_text + "\n```\n\n";
+
+        const ruleMappings = q.listMappings.all('rule', rule.id);
+        if (ruleMappings.length) {
+          out += `**Architecture mappings (Rule)**\n\n`;
+          for (const m of ruleMappings) {
+            out += `- ${m.type}: ${m.ref}${m.notes ? ` — ${m.notes}` : ''}\n`;
+          }
+          out += `\n`;
+        }
 
         const tcs = q.listTestCasesByRule.all(rule.id);
         out += `**Test Cases (${tcs.length})**\n\n`;
